@@ -5,6 +5,12 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
+# Minimum major.minor to sync for each PG major version.
+# Tags below these thresholds are ignored entirely.
+env:
+  MIN_PG15: "15.14"
+  MIN_PG17: "17.6"
+
 permissions:
   contents: write
 
@@ -26,26 +32,42 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Collect all clean numeric tags already in the fork
-          existing=$(git ls-remote --tags origin | jq -Rn '[inputs | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$") | .t] | sort')
+          existing=$(git ls-remote --tags origin \
+            | jq -Rn '[inputs | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$") | .t]')
 
-          # All clean numeric tags available locally (after upstream fetch)
-          all_tags=$(git tag -l | jq -Rn '[inputs | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort')
+          # All clean numeric tags available locally (after upstream fetch),
+          # filtered by the minimum major.minor thresholds
+          all_tags=$(git tag -l \
+            | jq -Rn --arg min15 "$MIN_PG15" --arg min17 "$MIN_PG17" '
+              [ inputs
+                | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                | . as $tag
+                | ($tag | split(".") | .[0] + "." + .[1]) as $major_minor
+                | ($tag | split(".")[0]) as $major
+                | if   $major == "15" then ($major_minor >= $min15)
+                  elif $major == "17" then ($major_minor >= $min17)
+                  else true
+                  end
+                | select(.)
+                | $tag
+              ]')
 
-          # New tags = all minus existing
+          # New tags = all (filtered) minus existing
           new_tags=$(jq -n --argjson all "$all_tags" --argjson existing "$existing" '$all - $existing | sort')
           new_count=$(echo "$new_tags" | jq 'length')
 
-          echo "Found $new_count new clean numeric tag(s)"
+          echo "Found $new_count new tag(s) above minimum thresholds"
 
           if [[ "$new_count" -eq 0 ]]; then
             echo "Nothing to sync"
             exit 0
           fi
 
-          # Push all new tags to origin (for reference/checkout — this does NOT trigger builds)
-          echo "$new_tags" | jq -r '.[]' | while read -r tag; do
-            git push origin "refs/tags/$tag" 2>/dev/null || true
-          done
+          echo "$new_tags" | jq -r '.[]'
+
+          # Push all new tags to origin in a single call
+          push_refs=$(echo "$new_tags" | jq -r '.[] | "refs/tags/\(.):refs/tags/\(.)"')
+          git push origin $push_refs
 
           # For each PG major version among the new tags, find the highest and dispatch a build
           latest_per_major=$(echo "$new_tags" | jq -r '
