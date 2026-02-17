@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: read
+      actions: write
     steps:
       - name: Find latest upstream tags and dispatch builds
         env:
@@ -25,8 +26,10 @@ jobs:
           REPO="${{ github.repository }}"
 
           # Get all clean numeric tags from upstream (no clone needed)
+          # Filter by minimum major.minor, keep only PG 15 and 17
+          # Output the latest tag per major version
           latest_per_major=$(git ls-remote --tags https://github.com/supabase/postgres.git \
-            | jq -Rn --arg min15 "$MIN_PG15" --arg min17 "$MIN_PG17" '
+            | jq -rRn --arg min15 "$MIN_PG15" --arg min17 "$MIN_PG17" '
               [ inputs
                 | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$")
                 | .t
@@ -35,7 +38,7 @@ jobs:
                 | ($tag | split(".")[0]) as $major
                 | if   $major == "15" then ($major_minor >= $min15)
                   elif $major == "17" then ($major_minor >= $min17)
-                  else true
+                  else false
                   end
                 | select(.)
                 | $tag
