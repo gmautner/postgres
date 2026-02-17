@@ -1,0 +1,60 @@
+name: Sync upstream tags
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/supabase/postgres.git
+          git fetch upstream --tags --force
+
+      - name: Sync tags and dispatch builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Collect all clean numeric tags already in the fork
+          existing=$(git ls-remote --tags origin | jq -Rn '[inputs | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$") | .t] | sort')
+
+          # All clean numeric tags available locally (after upstream fetch)
+          all_tags=$(git tag -l | jq -Rn '[inputs | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort')
+
+          # New tags = all minus existing
+          new_tags=$(jq -n --argjson all "$all_tags" --argjson existing "$existing" '$all - $existing | sort')
+          new_count=$(echo "$new_tags" | jq 'length')
+
+          echo "Found $new_count new clean numeric tag(s)"
+
+          if [[ "$new_count" -eq 0 ]]; then
+            echo "Nothing to sync"
+            exit 0
+          fi
+
+          # Push all new tags to origin (for reference/checkout — this does NOT trigger builds)
+          echo "$new_tags" | jq -r '.[]' | while read -r tag; do
+            git push origin "refs/tags/$tag" 2>/dev/null || true
+          done
+
+          # For each PG major version among the new tags, find the highest and dispatch a build
+          latest_per_major=$(echo "$new_tags" | jq -r '
+            group_by(split(".")[0])
+            | map(sort_by(split(".") | map(tonumber? // 0)) | last)
+            | .[]
+          ')
+
+          for tag in $latest_per_major; do
+            echo "Dispatching build for: $tag"
+            gh workflow run build-and-publish.yml -f tag="$tag"
+          done

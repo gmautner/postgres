@@ -1,0 +1,111 @@
+name: Build and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (e.g., 17.6.1.084)"
+        required: true
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/postgres
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Parse version from tag
+        id: version
+        run: |
+          TAG="${{ inputs.tag }}"
+          IFS='.' read -r MAJOR MINOR PATCH BUILD <<< "$TAG"
+
+          echo "pg_major=$MAJOR"       >> "$GITHUB_OUTPUT"
+          echo "tag_full=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "tag_patch=$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
+          echo "tag_minor=$MAJOR.$MINOR"        >> "$GITHUB_OUTPUT"
+          echo "tag_major=$MAJOR"               >> "$GITHUB_OUTPUT"
+
+      - name: Determine Dockerfile
+        id: dockerfile
+        run: |
+          DF="Dockerfile-${{ steps.version.outputs.pg_major }}"
+          if [[ ! -f "$DF" ]]; then
+            echo "::error::Dockerfile not found: $DF"
+            exit 1
+          fi
+          echo "path=$DF" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve which Docker tags this build should claim
+        id: tags
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}"
+          TAG_FULL="${{ steps.version.outputs.tag_full }}"
+          TAG_PATCH="${{ steps.version.outputs.tag_patch }}"
+          TAG_MINOR="${{ steps.version.outputs.tag_minor }}"
+          TAG_MAJOR="${{ steps.version.outputs.tag_major }}"
+
+          # The exact build tag is always pushed
+          TAGS="${IMAGE}:${TAG_FULL}"
+
+          # For each shared tag (patch, minor, major), check if the registry already
+          # has a higher version. If so, skip that tag to avoid a downgrade.
+          for level in patch minor major; do
+            case "$level" in
+              patch) candidate_tag="$TAG_PATCH" ;;
+              minor) candidate_tag="$TAG_MINOR" ;;
+              major) candidate_tag="$TAG_MAJOR" ;;
+            esac
+
+            # Fetch the current version label from the registry via JSON output
+            existing=$(
+              docker buildx imagetools inspect --format '{{json .}}' "${IMAGE}:${candidate_tag}" 2>/dev/null \
+                | jq -r '.config.Labels["org.opencontainers.image.version"] // empty' 2>/dev/null || true
+            )
+
+            if [[ -z "$existing" ]]; then
+              echo "$level tag ${candidate_tag}: no existing image — claiming"
+              TAGS="${TAGS},${IMAGE}:${candidate_tag}"
+            elif [[ "$(printf '%s\n%s\n' "$existing" "$TAG_FULL" | sort -V | tail -1)" == "$TAG_FULL" ]]; then
+              echo "$level tag ${candidate_tag}: current=${existing}, ours=${TAG_FULL} is >= — claiming"
+              TAGS="${TAGS},${IMAGE}:${candidate_tag}"
+            else
+              echo "$level tag ${candidate_tag}: current=${existing} is newer than ${TAG_FULL} — skipping"
+            fi
+          done
+
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.dockerfile.outputs.path }}
+          push: true
+          target: production
+          # arm64 via QEMU is very slow for Nix builds (~2-3h).
+          # For arm64, use native runners or split into a matrix like upstream does.
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.tag_full }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
