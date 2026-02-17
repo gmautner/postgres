@@ -11,38 +11,25 @@ env:
   MIN_PG15: "15.14"
   MIN_PG17: "17.6"
 
-permissions:
-  contents: write
-
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      packages: read
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Fetch upstream tags
-        run: |
-          git remote add upstream https://github.com/supabase/postgres.git
-          git fetch upstream --tags --force
-
-      - name: Sync tags and dispatch builds
+      - name: Find latest upstream tags and dispatch builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/postgres"
           REPO="${{ github.repository }}"
 
-          # Collect all clean numeric tags already in the repo
-          existing=$(gh api "repos/${REPO}/git/matching-refs/tags/" --paginate \
-            | jq '[.[].ref | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$") | .t]')
-
-          # All clean numeric tags available locally (after upstream fetch),
-          # filtered by the minimum major.minor thresholds
-          all_tags=$(git tag -l \
+          # Get all clean numeric tags from upstream (no clone needed)
+          latest_per_major=$(git ls-remote --tags https://github.com/supabase/postgres.git \
             | jq -Rn --arg min15 "$MIN_PG15" --arg min17 "$MIN_PG17" '
               [ inputs
-                | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$")
+                | .t
                 | . as $tag
                 | ($tag | split(".") | .[0] + "." + .[1]) as $major_minor
                 | ($tag | split(".")[0]) as $major
@@ -52,39 +39,21 @@ jobs:
                   end
                 | select(.)
                 | $tag
-              ]')
-
-          # New tags = all (filtered) minus existing
-          new_tags=$(jq -n --argjson all "$all_tags" --argjson existing "$existing" '$all - $existing | sort')
-          new_count=$(echo "$new_tags" | jq 'length')
-
-          echo "Found $new_count new tag(s) above minimum thresholds"
-
-          if [[ "$new_count" -eq 0 ]]; then
-            echo "Nothing to sync"
-            exit 0
-          fi
-
-          echo "$new_tags" | jq -r '.[]'
-
-          # Create tags via the GitHub API (bypasses workflow-file push protection)
-          echo "$new_tags" | jq -r '.[]' | while read -r tag; do
-            sha=$(git rev-parse "refs/tags/$tag")
-            echo "Creating tag $tag -> $sha"
-            gh api "repos/${REPO}/git/refs" \
-              -f ref="refs/tags/$tag" \
-              -f sha="$sha" \
-              --silent || echo "  WARNING: failed to create tag $tag"
-          done
-
-          # For each PG major version among the new tags, find the highest and dispatch a build
-          latest_per_major=$(echo "$new_tags" | jq -r '
-            group_by(split(".")[0])
-            | map(sort_by(split(".") | map(tonumber? // 0)) | last)
-            | .[]
-          ')
+              ]
+              | group_by(split(".")[0])
+              | map(sort_by(split(".") | map(tonumber? // 0)) | last)
+              | .[]
+            ')
 
           for tag in $latest_per_major; do
-            echo "Dispatching build for: $tag"
-            gh workflow run build-and-publish.yml -f tag="$tag"
+            echo "Latest upstream tag for PG $(echo "$tag" | cut -d. -f1): $tag"
+
+            # Check if this exact version is already built in ghcr.io
+            if docker buildx imagetools inspect "${IMAGE}:${tag}" >/dev/null 2>&1; then
+              echo "  Already built — skipping"
+              continue
+            fi
+
+            echo "  Not yet built — dispatching"
+            gh workflow run build-and-publish.yml --repo "$REPO" -f tag="$tag"
           done

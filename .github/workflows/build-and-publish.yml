@@ -21,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: supabase/postgres
           ref: refs/tags/${{ inputs.tag }}
 
       - name: Parse version from tag
