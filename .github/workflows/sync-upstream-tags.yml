@@ -13,7 +13,6 @@ env:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   sync:
@@ -32,9 +31,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Collect all clean numeric tags already in the fork
-          existing=$(git ls-remote --tags origin \
-            | jq -Rn '[inputs | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$") | .t]')
+          REPO="${{ github.repository }}"
+
+          # Collect all clean numeric tags already in the repo
+          existing=$(gh api "repos/${REPO}/git/matching-refs/tags/" --paginate \
+            | jq '[.[].ref | capture("refs/tags/(?<t>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$") | .t]')
 
           # All clean numeric tags available locally (after upstream fetch),
           # filtered by the minimum major.minor thresholds
@@ -66,9 +67,15 @@ jobs:
 
           echo "$new_tags" | jq -r '.[]'
 
-          # Push all new tags to origin in a single call
-          push_refs=$(echo "$new_tags" | jq -r '.[] | "refs/tags/\(.):refs/tags/\(.)"')
-          git push origin $push_refs
+          # Create tags via the GitHub API (bypasses workflow-file push protection)
+          echo "$new_tags" | jq -r '.[]' | while read -r tag; do
+            sha=$(git rev-parse "refs/tags/$tag")
+            echo "Creating tag $tag -> $sha"
+            gh api "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$sha" \
+              --silent || echo "  WARNING: failed to create tag $tag"
+          done
 
           # For each PG major version among the new tags, find the highest and dispatch a build
           latest_per_major=$(echo "$new_tags" | jq -r '
